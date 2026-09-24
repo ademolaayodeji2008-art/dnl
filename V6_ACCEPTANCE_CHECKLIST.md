@@ -1,0 +1,24 @@
+# v6.0 Acceptance Checklist
+
+- Login/session creation and logout revocation
+- Control Centre loads without card overlap
+- Customer credit days / hold / limit enforcement
+- Supplier credit days and default due dates
+- Receivables ageing
+- Payables ageing
+- Closed accounting period blocks new dated transactions
+- Month-end checklist prevents premature period close
+- Document sequence edits affect future documents only
+- High-value purchase/payment threshold enforcement
+- Audit exception scan / acknowledge / resolve
+- Chart of Accounts and manual balanced journal
+- Journal reversal
+- Operational-to-GL sync and duplicate-skip behavior
+- Trial Balance debit = credit
+- P&L and Balance Sheet load
+- Bank reconciliation create / statement lines / auto-match / manual match / complete
+- Budget creation and variance
+- Batch allocation and expiry alert
+- User session list and session revoke
+- Existing Payment Voucher approval/payment/confirmation flow remains intact
+- Existing sales, returns, purchases, refunds, banking, cold-room transfers and Business Reports remain intact

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dariltweens Nigeria Limited | Business & Payment Control System</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="loader" class="loader hidden"><div class="spinner"></div><div id="loaderTitle">Loading…</div><small id="loaderText"></small></div>
+<div id="toast"></div>
+
+<section id="authView" class="auth">
+  <div class="auth-brand">
+    <div class="brandmark">DNL</div>
+    <h1>Dariltweens Nigeria Limited</h1>
+    <p>Business & Payment Control System for sales, receivables, inventory, cheques and payment vouchers in one secure workflow.</p>
+  </div>
+  <div class="auth-card">
+    <div id="loginPanel">
+      <h2>Welcome back</h2>
+      <p class="muted">Sign in to continue.</p>
+      <label>Email</label><input id="loginEmail" type="email" autocomplete="username">
+      <label>Password</label>
+      <div class="pw"><input id="loginPassword" type="password" autocomplete="current-password"><button onclick="togglePw()">Show</button></div>
+      <label class="check"><input id="rememberMe" type="checkbox"> Remember my email</label>
+      <button class="primary wide" onclick="login()">Sign in</button><button class="link" onclick="forgotPassword()">Forgot password?</button>
+      <button class="link" onclick="showRegister()">Register as staff</button>
+    </div>
+    <div id="registerPanel" class="hidden">
+      <h2>Staff registration</h2>
+      <label>Staff ID</label><input id="regStaffId" onblur="verifyStaff()">
+      <div id="staffPreview" class="preview hidden"></div>
+      <label>Email</label><input id="regEmail" type="email">
+      <label>Password</label><input id="regPassword" type="password" oninput="renderPasswordRules('regPassword','regPasswordRules')"><div id="regPasswordRules"></div>
+      <button class="primary wide" onclick="registerStaff()">Create account</button>
+      <button class="link" onclick="showLogin()">Back to sign in</button>
+    </div>
+  </div>
+</section>
+
+<section id="appView" class="app hidden">
+  <div id="sidebarOverlay" class="sidebar-overlay" onclick="closeMobileSidebar()"></div>
+  <aside id="sidebar">
+    <div class="logo"><span class="logo-mark">DNL</span><span class="logo-text">Business System</span><button class="sidebar-toggle" onclick="toggleSidebar()" title="Collapse sidebar">☰</button></div>
+    <nav id="nav"></nav>
+    <button class="signout" onclick="logout()">⇥ Sign out</button>
+  </aside>
+  <main>
+    <header>
+      <button id="mobileMenuBtn" class="mobile-menu-btn" type="button" onclick="toggleMobileSidebar()" aria-label="Open navigation" aria-expanded="false">☰</button>
+      <div class="page-heading"><h2 id="pageTitle">Dashboard</h2><p id="pageSub"></p></div>
+      <div class="header-actions">
+        <button onclick="refreshPage()">↻</button>
+        <button onclick="toggleTheme()">◐</button>
+        <button class="notif-btn" onclick="showNotifications()">🔔<span id="notifBadge" class="notif-badge hidden">0</span></button>
+        <span id="userName"></span>
+      </div>
+    </header>
+    <section id="content"></section>
+  </main>
+</section>
+<script src="/app.js"></script>
+</body>
+</html>

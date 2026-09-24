@@ -1,0 +1,35 @@
+# Environment variables - NEVER commit these
+.env
+.env.local
+.env.production
+
+# Dependencies
+node_modules/
+
+# Uploads
+uploads/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build outputs
+dist/
+build/
+
+# Backups
+backups/
+
+# Nested old version folders
+payment-voucher-pro-v4.4/
+
+# Utility/debug scripts
+check-admin-staff.cjs
+check-super-admin.cjs
+inspect-prisma.cjs
+DNL_BEFORE_DEPLOYMENT_CLEANUP.backup

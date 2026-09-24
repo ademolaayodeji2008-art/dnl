@@ -1,0 +1,566 @@
+import { Router } from 'express';
+import { prisma } from '../src/prisma.js';
+import { auth, permit } from '../src/middleware.js';
+import { hashPassword,assertStrongPassword,generateTemporaryPassword } from '../src/security.js';
+import { audit, nextSequenceNo } from '../src/utils.js';
+import Papa from 'papaparse';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileAsync=promisify(execFile);
+
+const r=Router();
+r.use(auth);
+
+function requireOperationalAdmin(req,res,next){
+  if((req.roles||[]).includes('ADMIN')||(req.roles||[]).includes('SUPER_ADMIN')) return next();
+  if((req.permissions||[]).includes('SETTINGS_MANAGE')) return next();
+  return res.status(403).json({message:'Not authorized.'});
+}
+function requireSuperAdmin(req,res,next){
+  if(!(req.roles||[]).includes('SUPER_ADMIN')) return res.status(403).json({message:'Super Admin access required.'});
+  next();
+}
+
+const logoUpload=multer({storage:multer.memoryStorage(),limits:{fileSize:2*1024*1024},fileFilter:(req,file,cb)=>['image/png','image/jpeg','image/webp'].includes(file.mimetype)?cb(null,true):cb(new Error('Logo must be PNG, JPG or WEBP.'))});
+
+r.get('/staff',permit('STAFF_MANAGE'),async(req,res)=>{
+  const rows=await prisma.staff.findMany({orderBy:[{firstName:'asc'},{lastName:'asc'}]});
+  res.json({rows,count:rows.length});
+});
+r.post('/staff',permit('STAFF_MANAGE'),async(req,res)=>{
+  const data=req.body;
+  const row=await prisma.staff.create({data:{
+    staffId:String(data.staffId||'').trim().toUpperCase(),
+    firstName:String(data.firstName||'').trim(),
+    lastName:String(data.lastName||'').trim(),
+    department:String(data.department||'').trim(),
+    position:data.position||null,phone:data.phone||null,status:'ACTIVE'
+  }});
+  await audit(req.user.id,'CREATE_STAFF','STAFF',row.id,{staffId:row.staffId},req.ip);
+  res.json(row);
+});
+r.post('/staff/import',permit('STAFF_MANAGE'),async(req,res)=>{
+  const csv=String(req.body.csv||'');
+  const parsed=Papa.parse(csv,{header:true,skipEmptyLines:true});
+  let added=0,updated=0;
+  for(const x of parsed.data){
+    const staffId=String(x.STAFF_ID||x.staffId||'').trim().toUpperCase();
+    if(!staffId) continue;
+    const data={
+      firstName:String(x.FIRST_NAME||x.firstName||'').trim(),
+      lastName:String(x.LAST_NAME||x.lastName||'').trim(),
+      department:String(x.DEPARTMENT||x.department||'').trim(),
+      position:String(x.POSITION||x.position||'').trim()||null,
+      phone:String(x.PHONE||x.phone||'').trim()||null
+    };
+    const found=await prisma.staff.findUnique({where:{staffId}});
+    if(found){await prisma.staff.update({where:{staffId},data});updated++;}
+    else{await prisma.staff.create({data:{staffId,...data,status:'ACTIVE'}});added++;}
+  }
+  await audit(req.user.id,'IMPORT_STAFF','STAFF',null,{added,updated},req.ip);
+  res.json({added,updated});
+});
+
+r.get('/users',permit('USER_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const users=await prisma.user.findMany({
+    include:{roles:{where:{active:true},include:{role:true}}},
+    orderBy:[{firstName:'asc'},{lastName:'asc'}]
+  });
+  const staff=await prisma.staff.findMany({where:{status:'ACTIVE'},orderBy:{firstName:'asc'}});
+  const roles=await prisma.role.findMany({where:{active:true},orderBy:{name:'asc'}});
+  res.json({
+    users:users.map(u=>({...u,passwordHash:undefined,roles:u.roles.map(x=>x.role.code)})),
+    staff,roles
+  });
+});
+r.post('/users',permit('USER_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const {staffId,email,roles=[]}=req.body;
+  const staff=await prisma.staff.findUnique({where:{staffId}});
+  if(!staff)return res.status(404).json({message:'Staff record not found.'});
+  if(staff.registered)return res.status(409).json({message:'Staff already registered.'});
+  const password=String(req.body.password||'').trim()||generateTemporaryPassword();
+  assertStrongPassword(password);
+  const user=await prisma.$transaction(async tx=>{
+    const u=await tx.user.create({data:{
+      staffId,firstName:staff.firstName,lastName:staff.lastName,email:String(email).toLowerCase(),
+      passwordHash:await hashPassword(password),status:'ACTIVE',emailVerifiedAt:new Date(),mustChangePassword:true
+    }});
+    const desired=[...new Set(['STAFF',...roles])];
+    const roleRows=await tx.role.findMany({where:{code:{in:desired}}});
+    await tx.userRole.createMany({data:roleRows.map(role=>({userId:u.id,roleId:role.id}))});
+    await tx.staff.update({where:{staffId},data:{registered:true}});
+    return u;
+  });
+  await audit(req.user.id,'ADMIN_CREATE_USER','USER',user.id,{staffId,email,roles,mustChangePassword:true},req.ip);
+  res.json({message:'User created. Password change is required at first sign-in.',temporaryPassword:password});
+});
+r.put('/users/:id/roles',permit('USER_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const target=await prisma.user.findUnique({
+    where:{id:req.params.id},
+    include:{roles:{where:{active:true},include:{role:true}}}
+  });
+  if(!target) return res.status(404).json({message:'User not found.'});
+
+  const requested=Array.isArray(req.body.roles)?req.body.roles.map(String):[];
+  const desired=[...new Set(['STAFF',...requested])];
+  const validRoles=await prisma.role.findMany({where:{code:{in:desired},active:true}});
+  const validCodes=validRoles.map(r=>r.code);
+  const unknown=desired.filter(code=>!validCodes.includes(code));
+  if(unknown.length) return res.status(400).json({message:`Unknown/inactive role(s): ${unknown.join(', ')}`});
+
+  const oldRoles=target.roles.map(x=>x.role.code);
+  const removingSuper=oldRoles.includes('SUPER_ADMIN')&&!validCodes.includes('SUPER_ADMIN');
+  if(removingSuper){
+    const superRole=await prisma.role.findUnique({where:{code:'SUPER_ADMIN'}});
+    const activeSupers=superRole?await prisma.userRole.count({
+      where:{roleId:superRole.id,active:true,user:{status:'ACTIVE'}}
+    }):0;
+    if(activeSupers<=1) return res.status(409).json({message:'Cannot remove the SUPER_ADMIN role from the last active Super Admin.'});
+  }
+
+  await prisma.$transaction(async tx=>{
+    await tx.userRole.updateMany({where:{userId:req.params.id},data:{active:false}});
+    for(const role of validRoles){
+      await tx.userRole.upsert({
+        where:{userId_roleId:{userId:req.params.id,roleId:role.id}},
+        update:{active:true},
+        create:{userId:req.params.id,roleId:role.id,active:true}
+      });
+    }
+  });
+  await audit(req.user.id,'SET_USER_ROLES','USER',req.params.id,{
+    user:`${target.firstName} ${target.lastName}`,
+    from:oldRoles,to:validCodes
+  },req.ip);
+  res.json({message:'Roles updated successfully.',roles:validCodes});
+});
+
+
+// ---- Super Admin Role & Permission Configuration ----
+r.get('/role-permissions',permit('USER_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const [roles,permissions,links]=await Promise.all([
+    prisma.role.findMany({
+      where:{active:true},
+      orderBy:{name:'asc'}
+    }),
+    prisma.permission.findMany({
+      orderBy:{code:'asc'}
+    }),
+    prisma.rolePermission.findMany({
+      where:{allowed:true},
+      include:{role:true,permission:true}
+    })
+  ]);
+
+  const assigned={};
+  for(const role of roles) assigned[role.code]=[];
+
+  for(const link of links){
+    if(assigned[link.role.code]){
+      assigned[link.role.code].push(link.permission.code);
+    }
+  }
+
+  res.json({
+    roles:roles.map(x=>({
+      id:x.id,
+      code:x.code,
+      name:x.name,
+      protected:x.code==='SUPER_ADMIN'
+    })),
+    permissions:permissions.map(x=>({
+      id:x.id,
+      code:x.code,
+      description:x.description||x.code.replaceAll('_',' ')
+    })),
+    assigned
+  });
+});
+
+r.put('/role-permissions/:roleCode',permit('USER_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  try{
+    const roleCode=String(req.params.roleCode||'').trim().toUpperCase();
+
+    if(roleCode==='SUPER_ADMIN'){
+      return res.status(400).json({
+        message:'SUPER_ADMIN is permanently unrestricted and cannot be modified.'
+      });
+    }
+
+    const role=await prisma.role.findUnique({
+      where:{code:roleCode}
+    });
+
+    if(!role||!role.active){
+      return res.status(404).json({message:'Active role not found.'});
+    }
+
+    const requested=Array.isArray(req.body.permissions)
+      ? [...new Set(req.body.permissions.map(String))]
+      : [];
+
+    const permissionRows=await prisma.permission.findMany({
+      where:{code:{in:requested}}
+    });
+
+    const validCodes=permissionRows.map(x=>x.code);
+    const unknown=requested.filter(x=>!validCodes.includes(x));
+
+    if(unknown.length){
+      return res.status(400).json({
+        message:`Unknown permission(s): ${unknown.join(', ')}`
+      });
+    }
+
+    const beforeRows=await prisma.rolePermission.findMany({
+      where:{roleId:role.id,allowed:true},
+      include:{permission:true}
+    });
+    const before=beforeRows.map(x=>x.permission.code);
+
+    await prisma.$transaction(async tx=>{
+      await tx.rolePermission.updateMany({
+        where:{roleId:role.id},
+        data:{allowed:false}
+      });
+
+      for(const permission of permissionRows){
+        await tx.rolePermission.upsert({
+          where:{
+            roleId_permissionId:{
+              roleId:role.id,
+              permissionId:permission.id
+            }
+          },
+          update:{allowed:true},
+          create:{
+            roleId:role.id,
+            permissionId:permission.id,
+            allowed:true
+          }
+        });
+      }
+    });
+
+    await audit(
+      req.user.id,
+      'CONFIGURE_ROLE_PERMISSIONS',
+      'ROLE',
+      role.id,
+      {role:role.code,before,after:validCodes},
+      req.ip
+    );
+
+    res.json({
+      message:`${role.name} permissions updated successfully.`,
+      role:role.code,
+      permissions:validCodes
+    });
+  }catch(e){
+    res.status(400).json({message:e.message});
+  }
+});
+
+r.get('/categories',async(req,res)=>{
+  const rows=await prisma.expenseCategory.findMany({orderBy:{name:'asc'}});
+  res.json({rows,count:rows.length});
+});
+r.post('/categories',requireOperationalAdmin,async(req,res)=>{
+  const name=String(req.body.name||'').trim();
+  const code=name.toUpperCase().replace(/[^A-Z0-9]+/g,'_').replace(/^_+|_+$/g,'');
+  const row=await prisma.expenseCategory.upsert({where:{code},update:{name,active:true},create:{code,name,active:true}});
+  res.json(row);
+});
+r.put('/categories/:id',requireOperationalAdmin,async(req,res)=>{
+  const row=await prisma.expenseCategory.update({where:{id:req.params.id},data:{active:!!req.body.active}});
+  res.json(row);
+});
+
+r.get('/workflows',permit('APPROVAL_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const workflows=await prisma.approvalWorkflow.findMany({
+    include:{
+      levels:{
+        orderBy:{levelNo:'asc'},
+        include:{approvers:{include:{user:{select:{id:true,firstName:true,lastName:true,email:true,roles:{where:{active:true},include:{role:true}}}}}}}
+      }
+    },
+    orderBy:{name:'asc'}
+  });
+  const users=await prisma.user.findMany({
+    where:{status:'ACTIVE'},
+    select:{id:true,firstName:true,lastName:true,email:true,roles:{where:{active:true},include:{role:true}}},
+    orderBy:[{firstName:'asc'},{lastName:'asc'}]
+  });
+  const cleanUser=u=>({
+    id:u.id,firstName:u.firstName,lastName:u.lastName,email:u.email,
+    roles:(u.roles||[]).map(x=>x.role.code)
+  });
+  res.json({
+    workflows:workflows.map(w=>({
+      ...w,
+      minAmount:Number(w.minAmount),
+      maxAmount:w.maxAmount===null?null:Number(w.maxAmount),
+      levels:w.levels.map(l=>({
+        ...l,
+        approvers:l.approvers.map(a=>({...a,user:cleanUser(a.user)}))
+      }))
+    })),
+    users:users.map(cleanUser)
+  });
+});
+r.post('/workflows',permit('APPROVAL_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const row=await prisma.approvalWorkflow.create({data:{
+    name:req.body.name,minAmount:Number(req.body.minAmount||0),
+    maxAmount:req.body.maxAmount?Number(req.body.maxAmount):null,
+    department:req.body.department||null,active:true
+  }});
+  res.json(row);
+});
+r.post('/workflows/:id/levels',permit('APPROVAL_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const row=await prisma.approvalLevel.create({data:{
+    workflowId:req.params.id,levelNo:Number(req.body.levelNo),name:req.body.name,
+    mode:req.body.mode==='ALL'?'ALL':'ANY',minApprovals:Number(req.body.minApprovals||1)
+  }});
+  res.json(row);
+});
+r.post('/levels/:id/approvers',permit('APPROVAL_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const row=await prisma.approvalAuthorizer.upsert({
+    where:{levelId_userId:{levelId:req.params.id,userId:req.body.userId}},
+    update:{active:true},
+    create:{levelId:req.params.id,userId:req.body.userId,active:true}
+  });
+  res.json(row);
+});
+
+
+r.put('/workflows/:id',permit('APPROVAL_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const data={};
+  if(req.body.name!==undefined) data.name=String(req.body.name).trim();
+  if(req.body.minAmount!==undefined) data.minAmount=Number(req.body.minAmount||0);
+  if(req.body.maxAmount!==undefined) data.maxAmount=req.body.maxAmount===null||req.body.maxAmount===''?null:Number(req.body.maxAmount);
+  if(req.body.department!==undefined) data.department=req.body.department||null;
+  if(req.body.active!==undefined) data.active=!!req.body.active;
+  const row=await prisma.approvalWorkflow.update({where:{id:req.params.id},data});
+  await audit(req.user.id,'UPDATE_WORKFLOW','APPROVAL_WORKFLOW',row.id,data,req.ip);
+  res.json(row);
+});
+
+r.put('/levels/:id',permit('APPROVAL_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const data={};
+  if(req.body.name!==undefined) data.name=String(req.body.name).trim();
+  if(req.body.levelNo!==undefined) data.levelNo=Number(req.body.levelNo);
+  if(req.body.mode!==undefined) data.mode=req.body.mode==='ALL'?'ALL':'ANY';
+  if(req.body.minApprovals!==undefined) data.minApprovals=Math.max(1,Number(req.body.minApprovals||1));
+  if(req.body.active!==undefined) data.active=!!req.body.active;
+  const row=await prisma.approvalLevel.update({where:{id:req.params.id},data});
+  await audit(req.user.id,'UPDATE_APPROVAL_LEVEL','APPROVAL_LEVEL',row.id,data,req.ip);
+  res.json(row);
+});
+
+r.delete('/levels/:levelId/approvers/:userId',permit('APPROVAL_MANAGE'),async(req,res)=>{
+  const existing=await prisma.approvalAuthorizer.findUnique({
+    where:{levelId_userId:{levelId:req.params.levelId,userId:req.params.userId}}
+  });
+  if(!existing) return res.status(404).json({message:'Approver authorization not found.'});
+  await prisma.approvalAuthorizer.delete({
+    where:{levelId_userId:{levelId:req.params.levelId,userId:req.params.userId}}
+  });
+  await audit(req.user.id,'REMOVE_APPROVER','APPROVAL_LEVEL',req.params.levelId,{userId:req.params.userId},req.ip);
+  res.json({message:'Approver removed.'});
+});
+
+
+r.get('/company-settings',permit('SETTINGS_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const rows=await prisma.companySetting.findMany({orderBy:{key:'asc'}});
+  res.json(Object.fromEntries(rows.map(x=>[x.key,x.value||''])));
+});
+r.put('/company-settings',permit('SETTINGS_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const allowed=['COMPANY_NAME','COMPANY_ADDRESS','COMPANY_EMAIL','COMPANY_PHONE','CURRENCY','PV_PREFIX','TIMEZONE','EMAIL_ENABLED','SMTP_HOST','SMTP_PORT','SMTP_USER','SMTP_FROM','LOGO_URL'];
+  for(const key of allowed){
+    if(req.body[key]!==undefined) await prisma.companySetting.upsert({where:{key},update:{value:String(req.body[key])},create:{key,value:String(req.body[key])}});
+  }
+  await audit(req.user.id,'UPDATE_COMPANY_SETTINGS','SYSTEM','COMPANY_SETTINGS',{keys:Object.keys(req.body)},req.ip);
+  res.json({message:'Company settings saved.'});
+});
+
+
+r.post('/company-logo',permit('SETTINGS_MANAGE'),requireSuperAdmin,logoUpload.single('logo'),async(req,res)=>{
+  if(!req.file)return res.status(400).json({message:'Select a logo file.'});
+  const ext=req.file.mimetype==='image/png'?'.png':req.file.mimetype==='image/webp'?'.webp':'.jpg';
+  const pub=path.resolve('public'),name='company-logo'+ext;
+  for(const x of ['company-logo.png','company-logo.jpg','company-logo.webp'])try{fs.unlinkSync(path.join(pub,x))}catch{}
+  fs.writeFileSync(path.join(pub,name),req.file.buffer); const url='/'+name;
+  await prisma.companySetting.upsert({where:{key:'LOGO_URL'},update:{value:url},create:{key:'LOGO_URL',value:url}});
+  await prisma.setting.upsert({where:{key:'LOGO_URL'},update:{value:url},create:{key:'LOGO_URL',value:url}});
+  await audit(req.user.id,'UPDATE_COMPANY_LOGO','SYSTEM','COMPANY_SETTINGS',{url},req.ip);res.json({message:'Company logo updated.',url});
+});
+
+r.put('/staff/:id/status',permit('STAFF_MANAGE'),async(req,res)=>{
+  const status=['ACTIVE','INACTIVE','SUSPENDED'].includes(req.body.status)?req.body.status:'INACTIVE';
+  const row=await prisma.staff.update({where:{id:req.params.id},data:{status}});
+  if(row.staffId) await prisma.user.updateMany({where:{staffId:row.staffId},data:{status:status==='ACTIVE'?'ACTIVE':'INACTIVE'}});
+  await audit(req.user.id,'SET_STAFF_STATUS','STAFF',row.id,{status},req.ip);res.json({message:'Staff status updated.'});
+});
+r.put('/users/:id/status',permit('USER_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  if(req.params.id===req.user.id && req.body.status!=='ACTIVE') return res.status(400).json({message:'You cannot deactivate your own account.'});
+  const status=req.body.status==='ACTIVE'?'ACTIVE':'INACTIVE';
+  await prisma.user.update({where:{id:req.params.id},data:{status}});
+  await audit(req.user.id,'SET_USER_STATUS','USER',req.params.id,{status},req.ip);res.json({message:'User status updated.'});
+});
+r.post('/users/:id/reset-password',permit('USER_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const target=await prisma.user.findUnique({where:{id:req.params.id}});
+  if(!target)return res.status(404).json({message:'User not found.'});
+  const password=String(req.body.password||'').trim()||generateTemporaryPassword();
+  assertStrongPassword(password);
+  await prisma.user.update({where:{id:target.id},data:{passwordHash:await hashPassword(password),mustChangePassword:true,passwordChangedAt:new Date()}});
+  await audit(req.user.id,'ADMIN_RESET_PASSWORD','USER',target.id,{mustChangePassword:true},req.ip);
+  res.json({message:'Temporary password set. User must change it at next sign-in.',temporaryPassword:password});
+});
+r.get('/audit',permit('AUDIT_VIEW'),async(req,res)=>{
+  const page=Math.max(1,Number(req.query.page||1)),take=Math.min(100,Math.max(10,Number(req.query.take||30))),skip=(page-1)*take;
+  const where={}; if(req.query.action)where.action={contains:String(req.query.action),mode:'insensitive'}; if(req.query.entity)where.entity={contains:String(req.query.entity),mode:'insensitive'};
+  if(req.query.from||req.query.to)where.createdAt={...(req.query.from?{gte:new Date(req.query.from)}:{}),...(req.query.to?{lte:new Date(req.query.to+'T23:59:59')}:{})};
+  const [rows,total]=await Promise.all([prisma.auditLog.findMany({where,include:{user:{select:{firstName:true,lastName:true,email:true}}},orderBy:{createdAt:'desc'},skip,take}),prisma.auditLog.count({where})]);
+  res.json({rows,total,page,pages:Math.ceil(total/take)});
+});
+
+// ---- v5.9 Internal Audit Centre ----
+const riskyAuditActions=['DELETE','REFUND','RETURN','BOUNCE','CANCEL','ADJUST','TRANSFER','UPDATE','RESET_PASSWORD','ROLE'];
+r.get('/audit-summary',permit('AUDIT_VIEW'),async(req,res)=>{
+  const since=new Date(Date.now()-30*24*60*60*1000);
+  const [events30,openQueries,respondedQueries,resolved30,recent]=await Promise.all([
+    prisma.auditLog.count({where:{createdAt:{gte:since}}}),
+    prisma.auditQuery.count({where:{status:'OPEN'}}),
+    prisma.auditQuery.count({where:{status:'RESPONDED'}}),
+    prisma.auditQuery.count({where:{status:'RESOLVED',resolvedAt:{gte:since}}}),
+    prisma.auditLog.findMany({where:{createdAt:{gte:since},OR:riskyAuditActions.map(x=>({action:{contains:x,mode:'insensitive'}}))},include:{user:{select:{firstName:true,lastName:true,email:true}}},orderBy:{createdAt:'desc'},take:12})
+  ]);
+  const risky30=await prisma.auditLog.count({where:{createdAt:{gte:since},OR:riskyAuditActions.map(x=>({action:{contains:x,mode:'insensitive'}}))}});
+  res.json({events30,risky30,openQueries,respondedQueries,resolved30,recent});
+});
+r.get('/audit-queries',permit('AUDIT_VIEW'),async(req,res)=>{
+  const where={};if(req.query.status&&['OPEN','RESPONDED','RESOLVED'].includes(String(req.query.status)))where.status=String(req.query.status);
+  const rows=await prisma.auditQuery.findMany({where,orderBy:{createdAt:'desc'},take:250});
+  const ids=[...new Set(rows.flatMap(x=>[x.raisedById,x.respondedById,x.resolvedById]).filter(Boolean))];
+  const users=ids.length?await prisma.user.findMany({where:{id:{in:ids}},select:{id:true,firstName:true,lastName:true,email:true}}):[];const um=Object.fromEntries(users.map(x=>[x.id,x]));
+  res.json(rows.map(x=>({...x,raisedBy:um[x.raisedById]||null,respondedBy:um[x.respondedById]||null,resolvedBy:um[x.resolvedById]||null})));
+});
+r.post('/audit-queries',permit('AUDIT_QUERY_CREATE'),async(req,res)=>{
+  const title=String(req.body.title||'').trim(),description=String(req.body.description||'').trim();if(!title||!description)return res.status(400).json({message:'Query title and description are required.'});
+  const severity=['LOW','MEDIUM','HIGH','CRITICAL'].includes(req.body.severity)?req.body.severity:'MEDIUM';
+  const queryNo=await nextSequenceNo('AUDIT_QUERY','AQ',6);
+  const row=await prisma.auditQuery.create({data:{queryNo,auditLogId:req.body.auditLogId||null,entity:req.body.entity||null,entityId:req.body.entityId||null,title,description,severity,raisedById:req.user.id}});
+  await audit(req.user.id,'RAISE_AUDIT_QUERY','AUDIT_QUERY',row.id,{queryNo,severity,entity:row.entity,entityId:row.entityId},req.ip);res.json(row);
+});
+r.post('/audit-queries/:id/respond',permit('AUDIT_QUERY_RESPOND'),async(req,res)=>{
+  const response=String(req.body.response||'').trim();if(!response)return res.status(400).json({message:'A response is required.'});
+  const old=await prisma.auditQuery.findUnique({where:{id:req.params.id}});if(!old)return res.status(404).json({message:'Audit query not found.'});if(old.status==='RESOLVED')return res.status(400).json({message:'Resolved queries are locked.'});
+  const row=await prisma.auditQuery.update({where:{id:req.params.id},data:{response,respondedById:req.user.id,respondedAt:new Date(),status:'RESPONDED'}});
+  await audit(req.user.id,'RESPOND_AUDIT_QUERY','AUDIT_QUERY',row.id,{queryNo:row.queryNo},req.ip);res.json(row);
+});
+r.post('/audit-queries/:id/resolve',permit('AUDIT_QUERY_RESOLVE'),async(req,res)=>{
+  const resolution=String(req.body.resolution||'').trim();if(!resolution)return res.status(400).json({message:'Resolution note is required.'});
+  const old=await prisma.auditQuery.findUnique({where:{id:req.params.id}});if(!old)return res.status(404).json({message:'Audit query not found.'});
+  const row=await prisma.auditQuery.update({where:{id:req.params.id},data:{resolution,resolvedById:req.user.id,resolvedAt:new Date(),status:'RESOLVED'}});
+  await audit(req.user.id,'RESOLVE_AUDIT_QUERY','AUDIT_QUERY',row.id,{queryNo:row.queryNo},req.ip);res.json(row);
+});
+
+r.get('/health',permit('SETTINGS_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const started=Date.now(); await prisma.$queryRaw`SELECT 1`; const dbMs=Date.now()-started;
+  const [users,staff,vouchers,notifications]=await Promise.all([prisma.user.count(),prisma.staff.count(),prisma.voucher.count(),prisma.notification.count({where:{isRead:false}})]);
+  res.json({status:'OK',database:'CONNECTED',dbResponseMs:dbMs,uptimeSeconds:Math.round(process.uptime()),node:process.version,memoryMB:Math.round(process.memoryUsage().rss/1024/1024),counts:{users,staff,vouchers,unreadNotifications:notifications},time:new Date()});
+});
+
+
+// ---- v4.3 Backup & Restore Centre ----
+const backupDir=path.resolve('backups');
+fs.mkdirSync(backupDir,{recursive:true});
+const restoreUpload=multer({
+  storage:multer.memoryStorage(),
+  limits:{fileSize:100*1024*1024},
+  fileFilter:(req,file,cb)=>file.originalname.toLowerCase().endsWith('.sql')?cb(null,true):cb(new Error('Restore file must be a .sql PostgreSQL backup.'))
+});
+function dbTools(){
+  const bin=String(process.env.PG_BIN||'').trim();
+  return {
+    dump:bin?path.join(bin,process.platform==='win32'?'pg_dump.exe':'pg_dump'):'pg_dump',
+    psql:bin?path.join(bin,process.platform==='win32'?'psql.exe':'psql'):'psql'
+  };
+}
+function dbArgs(){
+  const u=new URL(process.env.DATABASE_URL);
+  return {
+    host:u.hostname,port:u.port||'5432',user:decodeURIComponent(u.username),
+    password:decodeURIComponent(u.password),database:u.pathname.replace(/^\//,'').split('?')[0]
+  };
+}
+function safeStamp(){
+  return new Date().toISOString().replace(/[:.]/g,'-');
+}
+async function createSqlBackup(prefix='pv-backup'){
+  if(!process.env.DATABASE_URL)throw new Error('DATABASE_URL is not configured.');
+  const db=dbArgs(),tools=dbTools(),file=`${prefix}-${safeStamp()}.sql`,full=path.join(backupDir,file);
+  const args=['--host',db.host,'--port',db.port,'--username',db.user,'--dbname',db.database,
+    '--format=p','--no-owner','--no-privileges','--clean','--if-exists','--file',full];
+  await execFileAsync(tools.dump,args,{env:{...process.env,PGPASSWORD:db.password},windowsHide:true,maxBuffer:10*1024*1024});
+  const st=fs.statSync(full);
+  return {file,size:st.size,createdAt:st.birthtime||st.mtime};
+}
+function backupRows(){
+  return fs.readdirSync(backupDir).filter(x=>x.toLowerCase().endsWith('.sql')).map(file=>{
+    const st=fs.statSync(path.join(backupDir,file));
+    return {file,size:st.size,createdAt:st.birthtime||st.mtime};
+  }).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
+}
+function requireSuper(req,res){
+  if(!(req.roles||[]).includes('SUPER_ADMIN')){
+    res.status(403).json({message:'Restore is restricted to Super Admin.'});return false;
+  }
+  return true;
+}
+
+r.get('/backups',permit('SETTINGS_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  res.json({rows:backupRows(),restoreAllowed:(req.roles||[]).includes('SUPER_ADMIN')});
+});
+r.post('/backups',permit('SETTINGS_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  try{
+    const row=await createSqlBackup();
+    await audit(req.user.id,'CREATE_DATABASE_BACKUP','SYSTEM',row.file,{size:row.size},req.ip);
+    res.json({message:'Database backup created successfully.',row});
+  }catch(e){
+    const hint=e.code==='ENOENT'?' PostgreSQL pg_dump was not found. Add PostgreSQL bin to PATH or set PG_BIN in .env.':'';
+    res.status(500).json({message:`Backup failed.${hint}`});
+  }
+});
+r.get('/backups/:file/download',permit('SETTINGS_MANAGE'),requireSuperAdmin,async(req,res)=>{
+  const file=path.basename(req.params.file);
+  const full=path.join(backupDir,file);
+  if(!file.toLowerCase().endsWith('.sql')||!fs.existsSync(full))return res.status(404).json({message:'Backup not found.'});
+  await audit(req.user.id,'DOWNLOAD_DATABASE_BACKUP','SYSTEM',file,null,req.ip);
+  res.download(full,file);
+});
+r.post('/backups/restore',permit('SETTINGS_MANAGE'),requireSuperAdmin,restoreUpload.single('backup'),async(req,res)=>{
+  if(!requireSuper(req,res))return;
+  if(String(req.body.confirm||'')!=='RESTORE DATABASE')return res.status(400).json({message:'Type RESTORE DATABASE exactly to confirm.'});
+  if(!req.file)return res.status(400).json({message:'Select a .sql backup file.'});
+  let pre;
+  try{
+    pre=await createSqlBackup('pre-restore');
+    const db=dbArgs(),tools=dbTools();
+    const temp=path.join(backupDir,`restore-upload-${Date.now()}.sql`);
+    fs.writeFileSync(temp,req.file.buffer);
+    try{
+      await execFileAsync(tools.psql,['--host',db.host,'--port',db.port,'--username',db.user,'--dbname',db.database,'--file',temp],
+        {env:{...process.env,PGPASSWORD:db.password},windowsHide:true,maxBuffer:20*1024*1024});
+    }finally{try{fs.unlinkSync(temp)}catch{}}
+    await audit(req.user.id,'RESTORE_DATABASE','SYSTEM',req.file.originalname,{preRestoreBackup:pre.file},req.ip);
+    res.json({message:'Database restore completed. A pre-restore safety backup was created.',preRestoreBackup:pre.file});
+  }catch(e){
+    res.status(500).json({message:'Restore failed. The current database was not intentionally deleted. Check PostgreSQL tools and server logs.',preRestoreBackup:pre?.file||null});
+  }
+});
+
+export default r;
