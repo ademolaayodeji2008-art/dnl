@@ -1,4 +1,4 @@
--- CreateTable AccountToken
+-- CreateTable AccountToken (safe)
 CREATE TABLE IF NOT EXISTS "AccountToken" (
     "id" TEXT NOT NULL,
     "userId" TEXT NOT NULL,
@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS "AccountToken" (
     CONSTRAINT "AccountToken_pkey" PRIMARY KEY ("id")
 );
 
--- CreateTable UserSession
+-- CreateTable UserSession (safe)
 CREATE TABLE IF NOT EXISTS "UserSession" (
     "id" TEXT NOT NULL,
     "sessionKey" TEXT NOT NULL,
@@ -27,18 +27,23 @@ CREATE TABLE IF NOT EXISTS "UserSession" (
     CONSTRAINT "UserSession_pkey" PRIMARY KEY ("id")
 );
 
--- CreateIndex
+-- CreateIndex (safe)
 CREATE UNIQUE INDEX IF NOT EXISTS "AccountToken_tokenHash_key" ON "AccountToken"("tokenHash");
 CREATE INDEX IF NOT EXISTS "AccountToken_userId_type_idx" ON "AccountToken"("userId", "type");
 CREATE INDEX IF NOT EXISTS "AccountToken_expiresAt_idx" ON "AccountToken"("expiresAt");
-
--- CreateIndex
 CREATE UNIQUE INDEX IF NOT EXISTS "UserSession_sessionKey_key" ON "UserSession"("sessionKey");
 CREATE INDEX IF NOT EXISTS "UserSession_userId_revokedAt_idx" ON "UserSession"("userId", "revokedAt");
 CREATE INDEX IF NOT EXISTS "UserSession_expiresAt_idx" ON "UserSession"("expiresAt");
 
--- AddForeignKey
-ALTER TABLE "AccountToken" ADD CONSTRAINT "AccountToken_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+-- AddForeignKey (safe)
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'AccountToken_userId_fkey') THEN
+    ALTER TABLE "AccountToken" ADD CONSTRAINT "AccountToken_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+  END IF;
+END $$;
 
--- AddForeignKey
-ALTER TABLE "UserSession" ADD CONSTRAINT "UserSession_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'UserSession_userId_fkey') THEN
+    ALTER TABLE "UserSession" ADD CONSTRAINT "UserSession_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+  END IF;
+END $$;
